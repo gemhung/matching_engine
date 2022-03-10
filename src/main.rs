@@ -1,182 +1,310 @@
+#![feature(map_first_last)]
 #![allow(unused)]
 
+use std::borrow::Borrow;
 use std::cmp::Ord;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
-use std::collections::*;
+use std::collections::HashMap;
 use std::ops::Deref;
+use std::ops::DerefMut;
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
 enum Side {
-    Sell,
-    Buy,
+    Bid = 0,
+    Ask = 1,
+}
+
+impl Side {
+    fn toggle(&self) -> Self {
+        match self {
+            Side::Bid => Side::Ask,
+            Side::Ask => Side::Bid,
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
 struct Order {
     pub order_no: usize,
-    pub price: usize,
+    pub price: usize, // if market order, it's ignored
     pub qty: usize,
     pub side: Side,
     pub order_type: OrderType,
-    pub condition: Condition
+    pub condition: Condition,
 }
 
 #[derive(Clone, Eq, PartialEq)]
 enum Condition {
-    GFD, // Good for Day
-    GTD, // Good till Date
-    FAK, // Fill and Kill (IOC)
-    FOK, // Fill or Kill
+    OnOpen,
+    OnClose,
+    Funari,
+    IOC, // Fill and Kill
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+enum OrderType {
+    Limit = 0,
+    Market = 1,
 }
 
 #[derive(Clone, Eq, PartialEq)]
-enum OrderType {
-    Market,
-    Limit,
+enum IN {
+    Limit(usize, OrderNo),
+    LimitRev(std::cmp::Reverse<usize>, OrderNo),
+    Market(OrderNo), // this index has no price reference cause it's market order
 }
 
-impl Ord for Order {
-    fn cmp(&self, other: &Order) -> std::cmp::Ordering {
-        self.price.cmp(&other.price)
+impl<T: Borrow<Order>> From<T> for IN {
+    fn from(order: T) -> IN {
+        let order = order.borrow();
+        match (order.side, order.order_type) {
+            (_, OrderType::Market) => IN::Market(OrderNo(order.order_no)),
+            (Side::Bid, OrderType::Limit) => {
+                IN::LimitRev(Reverse(order.price), OrderNo(order.order_no))
+            }
+            (Side::Ask, OrderType::Limit) => IN::Limit(order.price, OrderNo(order.order_no)),
+        }
     }
 }
 
-impl PartialOrd for Order {
-    fn partial_cmp(&self, other: &Order) -> Option<std::cmp::Ordering> {
-        Some(self.price.cmp(&other.price))
+impl Ord for IN {
+    fn cmp(&self, other: &IN) -> std::cmp::Ordering {
+        match (self, other) {
+            (IN::Market(order_no1), IN::Market(order_no2)) => order_no1.cmp(order_no2),
+            (IN::Market(_), _) => std::cmp::Ordering::Less,
+            (_, IN::Market(_)) => std::cmp::Ordering::Greater,
+            (IN::Limit(price1, order_no1), IN::Limit(price2, order_no2)) => {
+                price1.cmp(price2).then_with(|| order_no1.cmp(order_no2))
+            }
+            (IN::LimitRev(price1, order_no1), IN::LimitRev(price2, order_no2)) => {
+                price1.cmp(price2).then_with(|| order_no1.cmp(order_no2))
+            }
+            _ => panic!(""),
+        }
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+impl PartialOrd for IN {
+    fn partial_cmp(&self, other: &IN) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 struct OrderNo(usize);
 
 #[derive(Clone)]
 struct Quote(usize, usize); // (price, quantity)
 
-struct Book<INDEX: Ord, T> {
-    pub price: BTreeMap<INDEX, BTreeSet<OrderNo>>,
-    pub orders: HashMap<OrderNo, T>, // so we can remove and amend
-}
+#[derive(Clone, Default, Eq, PartialEq)]
+struct Book(BTreeSet<IN>);
 
-impl<INDEX: Ord, T> Book<INDEX, T> {
-    pub fn new() -> Book<INDEX, T> {
-        Book {
-            price: BTreeMap::<INDEX, BTreeSet<OrderNo>>::new(),
-            orders: HashMap::<OrderNo, T>::new(),
-        }
+impl Book {
+    pub fn new() -> Book {
+        Book(BTreeSet::new())
+    }
+
+    fn peek(&self) -> Option<(&usize, &OrderNo)> {
+        self.first().map(|index| match index {
+            IN::Market(order_no) => (&0, order_no),
+            IN::Limit(price, order_no) => (price, order_no),
+            IN::LimitRev(Reverse(price), order_no) => (price, order_no),
+        })
+    }
+
+    fn pop(&mut self) -> Option<(usize, OrderNo)> {
+        self.pop_first().map(|index| match index {
+            IN::Market(order_no) => (0, order_no),
+            IN::Limit(price, order_no) => (price, order_no),
+            IN::LimitRev(Reverse(price), order_no) => (price, order_no),
+        })
     }
 }
 
-impl<INDEX: Ord> Book<INDEX, Order> {
-    // O(log n)
-    pub fn best_price(&self) -> Option<&INDEX> {
-        self.price.keys().next()
-    }
-}
-
-impl<INDEX: Ord, T> Deref for BuyBook<INDEX, T> {
-    type Target = Book<std::cmp::Reverse<INDEX>, T>;
+impl Deref for Book {
+    type Target = BTreeSet<IN>;
     fn deref(&self) -> &Self::Target {
-        &self.book
+        &self.0
     }
 }
 
-impl<INDEX: Ord, T> Deref for SellBook<INDEX, T> {
-    type Target = Book<INDEX, T>;
-    fn deref(&self) -> &Self::Target {
-        &self.book
+impl DerefMut for Book {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
-struct BuyBook<INDEX: Ord, T> {
-    pub book: Book<std::cmp::Reverse<INDEX>, T>,
-}
-
-struct SellBook<INDEX: Ord, T> {
-    pub book: Book<INDEX, T>,
-}
-
-struct Asset {
+#[derive(Default)]
+struct OrderBook {
     pub name: String,
-    pub buy: BuyBook<usize, Order>,   // max-heap
-    pub sell: SellBook<usize, Order>, // min-heap
+    pub books: [Book; 4], // [0: bid_limit, 1: ask_limit, 2: bid_market, 3: ask_market]
+    pub orders: HashMap<OrderNo, Order>,
 }
 
-// IOC
-// FOK
-// Market
-// Limit
-
-impl Asset {
-    pub fn matches(&mut self, mut order: Order) -> Result<(), anyhow::Error> {
-        
-
-
-        
-
-
-        
-
-
-        Ok(())
+impl OrderBook {
+    fn write(&mut self, order: Order) {
+        self.orders.insert(OrderNo(order.order_no), order.clone());
+        self.books[OrderBook::index(&order)].insert(order.into());
     }
-    //pub fn matches(&mut self, mut order:Order) -> Result<(), anyhow::Error>{
-    //match order {
-    //Order{side: Side::Buy, order_type:OrderType::Market, ..}  => {}
-    //Order{side: Side::Buy, ..} if order.price >= sell. => {}
-    //_ => {}
-    //};
 
-    //Ok(())
-    //}
+    fn index(order: &Order) -> usize {
+        order.side as usize + order.order_type as usize * 2
+    }
 
-    fn buy(&mut self, order: Order) {}
+    fn limit_book_matches(&mut self, incoming: &mut Order) {
+        self.book_matches(incoming.side.toggle() as usize, incoming);
+    }
 
-    fn sell(&mut self, order: Order) {}
+    fn market_book_matches(&mut self, incoming: &mut Order) {
+        self.book_matches(incoming.side.toggle() as usize + 2, incoming);
+    }
 
-    /*
-    pub fn matches(&mut self, mut order: Order) -> Result<(), anyhow::Error>{
-        // highest Buy, sell
-        // lowest Sell, buy
-        while order.qty != 0 && matches!(self.price_heap.peek(), Some(Order{price, ..}) if price <= &order.price) {
-            let booked_qty = self.price_heap.peek().unwrap().qty;
-            if booked_qty > order.qty{
-                self.price_heap.peek_mut().map(|mut booked|{
-                    booked.qty-= std::mem::replace(&mut order.qty, 0);
-                    booked
-                });
-            }else {
-                let booked = self.price_heap.pop().unwrap();
-                order.qty-=booked.qty;
+    fn book_matches(&mut self, index: usize, incoming: &mut Order) -> Result<(), anyhow::Error> {
+        let book = &mut self.books[index];
+        while let Some((_, order_no)) = book.peek() {
+            /*
+            // might be already canceled
+            if !self.orders.contains_key(&order_no) {
+                let _ = book.pop();
+                continue;
+            }
+            */
+
+            // Book            v.s incoming order
+            // bid best_price  >=  ask price
+            // ask best_price  <=  bid price
+            let best_price = match try_trade(self.orders.get(&order_no).unwrap(), &incoming) {
+                Some(inner) => inner,
+                None => break, // there is a bid-ask spread
+            };
+
+            let (_, order_no) = book.pop().unwrap(); // never failed cause tradable
+            let mut book_order = self.orders.remove(&order_no).unwrap(); // never failed cause tradable
+
+            let min_qty = std::cmp::min(book_order.qty, incoming.qty);
+            incoming.qty -= min_qty;
+            book_order.qty -= min_qty;
+
+            if book_order.qty != 0 {
+                book.insert(book_order.into());
+            }
+
+            if incoming.qty == 0 {
+                break;
             }
         }
 
-        if order.qty != 0 {
-
-        }
-
         Ok(())
     }
-    */
+}
+
+fn try_trade(book_order: &Order, incoming: &Order) -> Option<usize> {
+    match (book_order, incoming) {
+        (
+            Order {
+                order_type: OrderType::Market,
+                ..
+            },
+            Order {
+                order_type: OrderType::Limit,
+                ..
+            },
+        ) => Some(incoming.price),
+        (
+            Order {
+                order_type: OrderType::Limit,
+                ..
+            },
+            Order {
+                order_type: OrderType::Market,
+                ..
+            },
+        ) => Some(book_order.price),
+
+        (
+            Order {
+                order_type: OrderType::Limit,
+                price: p1,
+                side: s1,
+                ..
+            },
+            Order {
+                order_type: OrderType::Limit,
+                price: p2,
+                side: s2,
+                ..
+            },
+        ) => match (s1, s2) {
+            // tradable if bid price is higher or equal to ask price
+            (Side::Bid, Side::Ask) => (p1 >= p2).then(|| *p2),
+            (Side::Ask, Side::Bid) => (p1 <= p2).then(|| *p1),
+            _ => unreachable!(""),
+        },
+
+        _ => unreachable!(""),
+    }
+}
+
+enum Status {
+    Filled,
+    PartialFilled,
+}
+
+impl OrderBook {
+    pub fn new(name: String) -> OrderBook {
+        OrderBook {
+            name,
+            ..Default::default()
+        }
+    }
+
+    // O(log n)
+    pub fn matches(&mut self, mut incoming: Order) {
+        // if it's a limit order, first check if there is a market order in book to match
+        if incoming.order_type == OrderType::Limit {
+            self.market_book_matches(&mut incoming);
+        }
+
+        // then check if there is a limit order in book to match
+        if incoming.qty != 0 {
+            self.limit_book_matches(&mut incoming);
+        }
+
+        // write back unfilled part
+        if incoming.qty != 0 && incoming.condition != Condition::IOC {
+            self.write(incoming);
+        }
+    }
+
+    // O(log n)
+    pub fn amend(&mut self, target: Order) {
+        self.orders
+            .get_mut(&OrderNo(target.order_no))
+            .map(|old: &mut Order| {
+                let index = OrderBook::index(&target);
+                // remove old price in book
+                let _r: bool = self.books[index].remove(&old.into());
+                // insert new price in book
+                let _r: bool = self.books[index].insert(target.borrow().into());
+
+                // update old in hashmap
+                *old = target;
+            });
+    }
+
+    // O(log n)
+    pub fn cancel(&mut self, target: Order) {
+        self.orders.remove(&OrderNo(target.order_no));
+        self.books[OrderBook::index(&target)].remove(&target.into());
+    }
 }
 
 fn main() {
-    let sell_book = SellBook {
-        book: Book::<usize, Order>::new(),
-    };
-
-    let best_price = sell_book.best_price();
-    //let r = sell_book.get(Order);
-
-    /*
-    let buy_order_book = OrderBook {
-        price_heap: BinaryHeap::<Order>::new(), // max-heap
-        cancel_map: HashSet::<OrderNo>::new(),
-        best_price: None,
-        last_executed_quote: None,
-    };
-    */
+    let bid_book = Book(BTreeSet::new());
+    let order_book = OrderBook::new("AAPL".to_string());
 
     println!("Hello, world!");
 }
