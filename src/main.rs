@@ -35,6 +35,12 @@ struct Order {
     pub condition: Condition,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Session {
+    Morning,
+    Afternoon,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 enum Condition {
     OnOpen,
@@ -169,7 +175,7 @@ impl OrderBook {
             // might be already canceled
             if !self.orders.contains_key(&order_no) {
                 let _ = book.pop();
-                continue;
+                continueg;
             }
             */
 
@@ -280,19 +286,29 @@ impl OrderBook {
     }
 
     // O(log n)
+    // Note: if price changed, we need to match it rather than just update
     pub fn amend(&mut self, target: Order) {
-        self.orders
-            .get_mut(&OrderNo(target.order_no))
-            .map(|old: &mut Order| {
-                let index = OrderBook::index(&target);
-                // remove old price in book
-                let _r: bool = self.books[index].remove(&old.into());
-                // insert new price in book
-                let _r: bool = self.books[index].insert(target.borrow().into());
+        let cur = self.orders.get(&OrderNo(target.order_no)).unwrap();
 
-                // update old in hashmap
-                *old = target;
-            });
+        if cur.price != target.price {
+            // remove old price in book
+            let index = OrderBook::index(&cur);
+            let _r: bool = self.books[index].remove(&cur.into());
+            self.matches(target);
+        } else {
+            self.orders
+                .get_mut(&OrderNo(target.order_no))
+                .map(|old: &mut Order| {
+                    let index = OrderBook::index(&target);
+                    // remove old price in book
+                    let _r: bool = self.books[index].remove(&old.into());
+                    // insert new price in book
+                    let _r: bool = self.books[index].insert(target.borrow().into());
+
+                    // update old in hashmap
+                    *old = target;
+                });
+        }
     }
 
     // O(log n)
