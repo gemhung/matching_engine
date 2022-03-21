@@ -128,6 +128,46 @@ impl Book {
             IN::LimitRev(Reverse(price), order_no) => (price, order_no),
         })
     }
+
+    fn prices(&self) -> Vec<usize> {
+        self.iter()
+            .map(|inner| match inner {
+                IN::Market(order_no) => unreachable!(),
+                IN::Limit(price, order_no) => *price,
+                IN::LimitRev(Reverse(price), order_no) => *price,
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn max_price(&self) -> Option<usize> {
+        // max-heap
+        if let Some(IN::Limit(price, _)) = self.first() {
+            return Some(*price);
+        }
+
+        // mean-heap
+        if let Some(IN::LimitRev(Reverse(price), _)) = self.last() {
+            return Some(*price);
+        }
+
+        // empty or market
+        None
+    }
+
+    fn min_price(&self) -> Option<usize> {
+        // max-heap
+        if let Some(IN::Limit(price, _)) = self.last() {
+            return Some(*price);
+        }
+
+        // mean-heap
+        if let Some(IN::LimitRev(Reverse(price), _)) = self.first() {
+            return Some(*price);
+        }
+
+        // empty or market
+        None
+    }
 }
 
 impl Deref for Book {
@@ -158,6 +198,19 @@ impl OrderBook {
 
     fn index(order: &Order) -> usize {
         order.side as usize + order.order_type as usize * 2
+    }
+
+    fn bid_index() -> usize {
+        0
+    }
+    fn ask_index() -> usize {
+        1
+    }
+    fn bid_market_index() -> usize {
+        2
+    }
+    fn ask_market_index() -> usize {
+        3
     }
 
     fn limit_book_matches(&mut self, incoming: &mut Order) {
@@ -268,7 +321,7 @@ impl OrderBook {
     }
 
     // O(log n)
-    pub fn matches(&mut self, mut incoming: Order) {
+    pub fn continous_matches(&mut self, mut incoming: Order) {
         // if it's a limit order, first check if there is a market order in book to match
         if incoming.order_type == OrderType::Limit {
             self.market_book_matches(&mut incoming);
@@ -285,6 +338,48 @@ impl OrderBook {
         }
     }
 
+    fn call_auction(&mut self) -> Option<usize> {
+
+        let max_bid = self.books[OrderBook::bid_index()].max_price()?;
+        let min_bid = self.books[OrderBook::bid_index()].min_price()?;
+
+        let max_ask = self.books[OrderBook::ask_index()].max_price()?;
+        let min_ask = self.books[OrderBook::ask_index()].min_price()?;
+        
+        let max = std::cmp::max(max_bid, max_bid);
+        let min = std::cmp::max(min_bid, min_ask);
+
+        let len = max-min+1;
+
+        let mut bid_num = vec![0; len];
+        let mut ask_num = vec![0; len];
+
+        let mut bid_market_num = 0;
+        let mut ask_market_num = 0;
+        self.orders.values().for_each(|o|{
+            match o {
+                Order{qty, side: Side::Bid, order_type: OrderType::Market, ..} => bid_market_num+=qty,
+                Order{qty, side: Side::Ask, order_type: OrderType::Market, ..} => ask_market_num+=qty,
+                Order{qty, side: Side::Bid, order_type: OrderType::Limit, price, ..} => bid_num[price-min]+=qty,
+                Order{qty, side: Side::Ask, order_type: OrderType::Limit, price, ..} => ask_num[price-min]+=qty,
+            }
+        });
+
+        // pre-fix
+        ask_num[0] += ask_market_num;
+        for i in 1..len {
+            ask_num[i] += ask_num[i-1];
+        }
+
+        // pre-fix
+        bid_num[len-1] += bid_market_num;
+        for i in (0..len-1).rev() {
+            bid_num[i] += bid_num[i+1];
+        }
+
+        None
+    }
+
     // O(log n)
     // Note: if price changed, we need to match it rather than just update
     pub fn amend(&mut self, target: Order) {
@@ -294,7 +389,7 @@ impl OrderBook {
             // remove old price in book
             let index = OrderBook::index(&cur);
             let _r: bool = self.books[index].remove(&cur.into());
-            self.matches(target);
+            self.continous_matches(target);
         } else {
             self.orders
                 .get_mut(&OrderNo(target.order_no))
@@ -316,6 +411,38 @@ impl OrderBook {
         self.orders.remove(&OrderNo(target.order_no));
         self.books[OrderBook::index(&target)].remove(&target.into());
     }
+}
+
+
+fn merge(a: Vec<usize>, b: Vec<usize>) -> Vec<usize> {
+
+    let n1= a.len();
+    let n2= b.len();
+    let mut ret: Vec<usize> = vec![];
+    ret.reserve(a.len() + b.len());
+
+    let mut i = 0;
+    let mut j = 0;
+
+    while i<n1 && j<n2 {
+        if a[i] < b[j] {
+            ret.push(a[i]);
+            i+=1;
+        }else{
+            ret.push(b[j]);
+            j+=1;
+        }
+    }
+
+    for index in i..n1 {
+        ret.push(a[index]);
+    }
+
+    for index in j..n1 {
+        ret.push(b[index]);
+    }
+
+    ret
 }
 
 fn main() {
